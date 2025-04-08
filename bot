@@ -1,0 +1,224 @@
+
+import os
+import sqlite3
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler, Filters
+from youtube_search import YoutubeSearch
+import youtube_dl
+
+TOKEN = "7862387777:AAFBIkj58k5jUj_fY-GdsaI1gNZnLCY2N2s"
+ADMIN_IDS = [8170796045]
+DB_NAME = "bot_database.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS group_settings
+                     (chat_id INTEGER PRIMARY KEY, 
+                      welcome_msg TEXT, 
+                      rules TEXT,
+                      max_warns INTEGER DEFAULT 3)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS banned_users
+                     (user_id INTEGER, 
+                      chat_id INTEGER,
+                      reason TEXT,
+                      banned_by INTEGER,
+                      ban_date TIMESTAMP,
+                      PRIMARY KEY (user_id, chat_id))''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS warnings
+                     (user_id INTEGER,
+                      chat_id INTEGER,
+                      warning TEXT,
+                      warned_by INTEGER,
+                      warn_date TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def download_song(query, chat_id):
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': f'{chat_id}.%(ext)s',
+        }
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch:{query}", download=True)['entries'][0]
+            return {'file': f'{chat_id}.mp3', 'title': info['title'], 'duration': info['duration']}
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+def warn_user(chat_id, user_id, reason, admin_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO warnings VALUES (?, ?, ?, ?, ?)",
+                   (user_id, chat_id, reason, admin_id, datetime.now()))
+    cursor.execute("SELECT COUNT(*) FROM warnings WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+    warn_count = cursor.fetchone()[0]
+    cursor.execute("SELECT max_warns FROM group_settings WHERE chat_id=?", (chat_id,))
+    result = cursor.fetchone()
+    max_warns = result[0] if result else 3
+    conn.commit()
+    conn.close()
+    return warn_count >= max_warns
+
+def ban_user(chat_id, user_id, reason, admin_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO banned_users VALUES (?, ?, ?, ?, ?)",
+                       (user_id, chat_id, reason, admin_id, datetime.now()))
+        conn.commit()
+        return True
+    except:
+        return False
+    finally:
+        conn.close()
+
+def get_group_settings(chat_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM group_settings WHERE chat_id=?", (chat_id,))
+    settings = cursor.fetchone()
+    conn.close()
+    if not settings:
+        return {
+            'welcome_msg': "مرحباً بك في المجموعة!",
+            'rules': "الرجاء الالتزام بقواعد المجموعة.",
+            'max_warns': 3
+        }
+    return {
+        'welcome_msg': settings[1],
+        'rules': settings[2],
+        'max_warns': settings[3]
+    }
+
+def start(update: Update, context: CallbackContext):
+    user = update.effective_user
+    buttons = [
+        [InlineKeyboardButton("🎵 قسم الموسيقى", callback_data='music_section')],
+        [InlineKeyboardButton("⚙️ إدارة المجموعة", callback_data='group_management')],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data='stats'),
+         InlineKeyboardButton("ℹ️ المساعدة", callback_data='help')]
+    ]
+    update.message.reply_text(
+        f"مرحباً {user.first_name}!
+"
+        "👑 أنا بوتك الخاص بإدارة المجموعات وتشغيل الموسيقى
+
+"
+        "اختر أحد الأقسام:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+def handle_music_section(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    buttons = [
+        [InlineKeyboardButton("🔍 بحث عن أغنية", callback_data='search_song')],
+        [InlineKeyboardButton("🎵 تشغيل مباشر", callback_data='play_song')],
+        [InlineKeyboardButton("🔙 رجوع", callback_data='main_menu')]
+    ]
+    query.edit_message_text("🎶 قسم الموسيقى:
+
+اختر أحد الخيارات:", reply_markup=InlineKeyboardMarkup(buttons))
+
+def handle_group_management(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    if query.from_user.id not in ADMIN_IDS:
+        query.edit_message_text("⛔ ليس لديك صلاحية الوصول إلى هذه الأداة!")
+        return
+    buttons = [
+        [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data='member_management')],
+        [InlineKeyboardButton("⚙️ إعدادات المجموعة", callback_data='group_settings')],
+        [InlineKeyboardButton("📝 القوانين", callback_data='group_rules')],
+        [InlineKeyboardButton("🔙 رجوع", callback_data='main_menu')]
+    ]
+    query.edit_message_text("⚙️ قسم إدارة المجموعة:
+
+اختر أداة الإدارة:", reply_markup=InlineKeyboardMarkup(buttons))
+
+def handle_member_management(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    buttons = [
+        [InlineKeyboardButton("🔇 كتم عضو", callback_data='mute_member'),
+         InlineKeyboardButton("🚫 حظر عضو", callback_data='ban_member')],
+        [InlineKeyboardButton("✅ رفع الحظر", callback_data='unban_member'),
+         InlineKeyboardButton("⚠️ إعطاء تحذير", callback_data='warn_member')],
+        [InlineKeyboardButton("🔙 رجوع", callback_data='group_management')]
+    ]
+    query.edit_message_text("👥 إدارة الأعضاء:
+
+اختر الإجراء المطلوب:", reply_markup=InlineKeyboardMarkup(buttons))
+
+def handle_messages(update: Update, context: CallbackContext):
+    if 'mode' not in context.user_data:
+        return
+    if context.user_data['mode'] == 'search':
+        results = YoutubeSearch(update.message.text, max_results=5).to_dict()
+        buttons = []
+        for i, result in enumerate(results[:5]):
+            buttons.append([InlineKeyboardButton(f"{i+1}. {result['title']} ({result['duration']})",
+                                                 callback_data=f"download_{result['id']}")])
+        update.message.reply_text("🔍 نتائج البحث:", reply_markup=InlineKeyboardMarkup(buttons))
+    elif context.user_data['mode'] == 'play':
+        song = download_song(update.message.text, update.message.chat_id)
+        if song:
+            update.message.reply_audio(audio=open(song['file'], 'rb'),
+                                       title=song['title'],
+                                       duration=song['duration'])
+            os.remove(song['file'])
+        else:
+            update.message.reply_text("❌ حدث خطأ أثناء التحميل!")
+
+def button_click(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    if query.data == 'main_menu':
+        start(update, context)
+    elif query.data == 'music_section':
+        handle_music_section(update, context)
+    elif query.data == 'group_management':
+        handle_group_management(update, context)
+    elif query.data == 'member_management':
+        handle_member_management(update, context)
+    elif query.data == 'search_song':
+        query.edit_message_text("🔍 أرسل اسم الأغنية التي تريد البحث عنها:")
+        context.user_data['mode'] = 'search'
+    elif query.data == 'play_song':
+        query.edit_message_text("🎵 أرسل رابط يوتيوب أو اسم الأغنية:")
+        context.user_data['mode'] = 'play'
+    elif query.data.startswith('download_'):
+        video_id = query.data.split('_')[1]
+        song = download_song(video_id, query.message.chat_id)
+        if song:
+            query.message.reply_audio(audio=open(song['file'], 'rb'),
+                                      title=song['title'],
+                                      duration=song['duration'])
+            os.remove(song['file'])
+        else:
+            query.message.reply_text("❌ حدث خطأ أثناء التحميل!")
+
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CallbackQueryHandler(button_click))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_messages))
+    print(f"🤖 البوت يعمل الآن للمستخدم: {ADMIN_IDS[0]}")
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    print("⚡ جاري تشغيل البوت الخاص بك...")
+    print(f"👤 أنت المسؤول الرئيسي (ID: {ADMIN_IDS[0]})")
+    main()
